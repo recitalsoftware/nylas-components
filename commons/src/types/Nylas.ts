@@ -149,6 +149,8 @@ export interface NError {
 }
 
 export interface Manifest {
+  id?: string;
+  access_token?: string;
   error?: NError;
 }
 

@@ -15,3 +15,15 @@ export enum MailboxActions {
   STAR = "star",
   UNREAD = "unread",
 }
+
+export enum ComponentType {
+  AGENDA,
+  AVAILABILITY,
+  COMPOSER,
+  CONTACT_LIST,
+  CONVERSATION,
+  EMAIL,
+  MAILBOX,
+  SCHEDULE_EDITOR,
+  SCHEDULER,
+}

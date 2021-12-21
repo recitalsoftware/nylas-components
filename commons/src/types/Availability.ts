@@ -24,6 +24,7 @@ export interface Manifest extends NylasManifest {
   participants: string[];
   end_hour: number;
   event_buffer: number;
+  events: EventDefinition[];
   free_color: string;
   mandate_top_of_hour: boolean;
   max_bookable_slots: number;
@@ -45,7 +46,10 @@ export interface Manifest extends NylasManifest {
   start_hour: number;
   view_as: "schedule" | "list";
   timezone: string;
-  events: EventDefinition[];
+
+  allCalendars: Calendar[];
+  containerWidth: number;
+  days: Day[];
 }
 
 export interface AvailabilityRule {

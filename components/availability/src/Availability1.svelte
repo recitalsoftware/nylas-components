@@ -12,14 +12,13 @@
     ErrorStore,
     ContactStore,
     ConsecutiveAvailabilityStore,
-  } from "../../../commons/../commons/../commons/src";
+  } from "../../../commons/src";
   import { handleError } from "@commons/methods/api";
   import { onMount, afterUpdate, tick } from "svelte";
   import { get_current_component } from "svelte/internal";
   import {
     getEventDispatcher,
     buildInternalProps,
-    arrayContainsArray,
   } from "@commons/methods/component";
   import type { TimeInterval } from "d3-time";
   import { timeWeek, timeDay, timeHour, timeMinute } from "d3-time";
@@ -44,10 +43,10 @@
     Day,
     PreDatedTimeSlot,
     OpenHours,
+    ConsecutiveAvailabilityQuery,
   } from "@commons/types/Availability";
   import "@commons/components/ContactImage/ContactImage.svelte";
   import "@commons/components/ErrorMessage.svelte";
-  import { StateStore } from "./StateStore";
   import {
     getTimeString,
     getCondensedTimeString,
@@ -62,8 +61,6 @@
   import { createConsecutiveQueryKey } from "./method/consecutive";
   import type { EventDefinition } from "@commonstypes/ScheduleEditor";
   import type { ConsecutiveEvent } from "@commonstypes/Scheduler";
-  import { generateDaySlots, overlap } from "./method/availabilityUtils";
-  import { ComponentType } from "@commons/enums/Nylas";
 
   //#region props
   export let id: string = "";
@@ -231,12 +228,12 @@
     }
   }
 
-  let stateId: string;
-
+  $: calendarID = "";
   onMount(async () => {
     await tick();
     loading = true;
     clientHeight = main?.getBoundingClientRect().height;
+    dayContainerWidth = main?.getBoundingClientRect().height;
     const storeKey = JSON.stringify({
       component_id: id,
       access_token,
@@ -244,12 +241,16 @@
     manifest = (await $ManifestStore[storeKey]) || {};
 
     _this = buildInternalProps($$props, manifest, defaultValueMap) as Manifest;
-    _this.containerWidth = main?.getBoundingClientRect().height;
-    _this.allCalendars = allCalendars;
 
-    stateId = StateStore.register(_this, ComponentType.AVAILABILITY);
-
+    const calendarQuery: CalendarQuery = {
+      access_token,
+      component_id: id,
+      calendarIDs: [], // empty array will fetch all calendars
+    };
+    // TODO: we probably dont want to expose a list of all a users calendars to the end-user here.
+    const calendarsList = await CalendarStore.getCalendars(calendarQuery);
     loading = false;
+    calendarID = calendarsList?.find((cal) => cal.is_primary)?.id || "";
   });
 
   let previousProps = $$props;
@@ -321,7 +322,22 @@
   let main: HTMLElement;
   let tickContainer: HTMLElement;
   let dayContainer: HTMLElement;
+  let dayContainerWidth: number = 0;
   let clientHeight: number;
+
+  const MINIMUM_DAY_WIDTH = 100;
+
+  // Internally-settable reactive-to-external-props variable
+  let datesToShow: number;
+
+  $: optimalDatesToShow =
+    Math.floor(dayContainerWidth / MINIMUM_DAY_WIDTH) || 1;
+  $: datesToShow =
+    optimalDatesToShow < _this.dates_to_show || _this.show_as_week
+      ? optimalDatesToShow
+      : _this.dates_to_show;
+
+  $: tooSmallForWeek = _this.show_as_week && optimalDatesToShow < 7;
 
   //#endregion layout
 
@@ -329,6 +345,252 @@
 
   // You can have as few as 1, and as many as 7, days shown
   // start_date and datesToShow get overruled by show_as_week (always shows 5 or 7 dates that include your start_date instead)
+  let startDay: Date; // the first day column shown; depends on show_as_week
+  let endDay: Date;
+
+  $: dayRange = (() => {
+    return (
+      (_this.show_weekends || !_this.show_weekends) &&
+      generateDayRange(
+        startDay, // TODO: weird just to get show_weekends passed in
+        _this.show_as_week
+          ? timeDay.offset(startDay, tooSmallForWeek ? datesToShow - 1 : 6)
+          : timeDay.offset(startDay, datesToShow - 1),
+      )
+    );
+  })();
+
+  $: startDay = (() => {
+    return _this.show_as_week && !tooSmallForWeek
+      ? timeWeek.floor(_this.start_date)
+      : timeDay.floor(_this.start_date);
+  })();
+
+  $: endDay = dayRange[dayRange.length - 1];
+
+  const allRequiredParticipantsIncluded = (calendars: string[]) => {
+    return requiredParticipants.every((participant) =>
+      calendars.includes(participant),
+    );
+  };
+
+  // map over the ticks() of the time scale between your start day and end day
+  // populate them with as many slots as your start_hour, end_hour, and slot_size dictate
+  $: generateDaySlots = function (
+    timestamp: Date,
+    startHour: number,
+    endHour: number,
+  ) {
+    const dayStart = timeHour(
+      new Date(new Date(timestamp).setHours(startHour)),
+    );
+    const dayEnd = timeHour(new Date(new Date(timestamp).setHours(endHour)));
+    return scaleTime()
+      .domain([dayStart, dayEnd])
+      .ticks(timeMinute.every(_this.slot_size) as TimeInterval)
+      .slice(0, -1) // dont show the 25th hour
+      .map((time: Date) => {
+        const endTime = timeMinute.offset(time, _this.slot_size);
+        const freeCalendars: string[] = [];
+        let availability = AvailabilityStatus.FREE; // default
+        if (allCalendars.length) {
+          for (const calendar of allCalendars) {
+            // Adjust calendar.timeslots for buffers
+            const timeslots =
+              calendar.availability === AvailabilityStatus.BUSY
+                ? calendar.timeslots.map((slot: TimeSlot) => ({
+                    start_time: timeMinute.offset(
+                      slot.start_time,
+                      -_this.event_buffer,
+                    ),
+                    end_time: timeMinute.offset(
+                      slot.end_time,
+                      _this.event_buffer,
+                    ),
+                    available_calendars: slot.available_calendars,
+                  }))
+                : calendar.timeslots.map((slot: TimeSlot) => ({
+                    // Don't apply start-buffer to the first timeslot, nor end-buffer to the last timeslot.
+                    // Works across multiple days; you won't get a random buffer at 11:50 / 00:10
+                    start_time: timeMinute.offset(
+                      slot.start_time,
+                      slot === calendar.timeslots[0] ? 0 : _this.event_buffer,
+                    ),
+                    end_time: timeMinute.offset(
+                      slot.end_time,
+                      slot === calendar.timeslots[calendar.timeslots.length - 1]
+                        ? 0
+                        : -_this.event_buffer,
+                    ),
+                    available_calendars: slot.available_calendars,
+                  }));
+
+            const slot: TimeSlot = {
+              start_time: time,
+              end_time: endTime,
+              available_calendars: [],
+            };
+
+            let concurrentSlotEventsForUser = 0;
+            if (calendar.availability === AvailabilityStatus.BUSY) {
+              // For Busy calendars, a timeslot is considered available if its calendar has no overlapping events
+              concurrentSlotEventsForUser = overlap(timeslots, slot);
+            } else if (calendar.availability === AvailabilityStatus.FREE) {
+              // For Free calendars, a timeslot is considered available if its calendar has a time that fully envelops it.
+              concurrentSlotEventsForUser = timeslots.some(
+                (blob: TimeSlot) =>
+                  slot.start_time >= blob.start_time &&
+                  slot.end_time <= blob.end_time,
+              )
+                ? 1
+                : 0;
+              // slot availability is when a given timeslot has all of its minutes represented in calendar.free timeslots
+            }
+            if (calendar.availability === AvailabilityStatus.BUSY) {
+              if (
+                _this.capacity &&
+                _this.capacity >= 1 &&
+                concurrentSlotEventsForUser < _this.capacity
+              ) {
+                freeCalendars.push(calendar?.account?.emailAddress || "");
+              } else if (!concurrentSlotEventsForUser) {
+                freeCalendars.push(calendar?.account?.emailAddress || "");
+              }
+            } else if (
+              calendar.availability === AvailabilityStatus.FREE ||
+              !calendar.availability
+            ) {
+              // if a calendar is passed in without availability, assume the timeslots are available.
+              if (concurrentSlotEventsForUser) {
+                freeCalendars.push(calendar?.account?.emailAddress || "");
+              }
+            }
+          }
+
+          if (freeCalendars.length) {
+            if (freeCalendars.length === allCalendars.length) {
+              availability = AvailabilityStatus.FREE;
+            } else {
+              availability = AvailabilityStatus.PARTIAL;
+            }
+          } else {
+            availability = AvailabilityStatus.BUSY;
+          }
+        }
+
+        // If availability is partial (not 100% of calendars), and that ratio is less than partial_bookable_ratio,
+        // mark the slot as busy
+        if (
+          availability === AvailabilityStatus.PARTIAL &&
+          freeCalendars.length <
+            allCalendars.length * _this.partial_bookable_ratio
+        ) {
+          availability = AvailabilityStatus.BUSY;
+        }
+
+        // Allows users to book over busy slots if partial_bookable_ratio is 0
+        if (
+          availability === AvailabilityStatus.BUSY &&
+          _this.partial_bookable_ratio === 0
+        ) {
+          availability = AvailabilityStatus.PARTIAL;
+        }
+
+        // If availability is partial, but a required participant is unavailble, the slot becomes Busy
+        if (
+          availability === AvailabilityStatus.PARTIAL &&
+          _this.required_participants.length
+        ) {
+          if (!allRequiredParticipantsIncluded(freeCalendars)) {
+            availability = AvailabilityStatus.BUSY;
+          }
+        }
+
+        // If mandate_top_of_hour, change any status to "busy" if it's not at :00
+        if (_this.mandate_top_of_hour && time.getMinutes() !== 0) {
+          availability = AvailabilityStatus.BUSY;
+          freeCalendars.length = 0;
+        }
+
+        // if the "open_hours" property has rules, adhere to them above any other event-based free/busy statuses
+        // (Mark the slot busy if it falls outside the open_hours)
+        if (_this.open_hours.length) {
+          if (availability !== AvailabilityStatus.BUSY) {
+            let dayRelevantRules = [];
+            dayRelevantRules = _this.open_hours.filter(
+              (rule) =>
+                !rule.hasOwnProperty("startWeekday") ||
+                rule.startWeekday === time.getDay() ||
+                rule.endWeekday === time.getDay(),
+            );
+            let slotExistsInOpenHours = dayRelevantRules.some((rule, iter) => {
+              let ruleStartAppliedDate = rule.hasOwnProperty("startWeekday")
+                ? timeDay.offset(
+                    time,
+                    (rule.startWeekday as number) - time.getDay(),
+                  )
+                : new Date(time);
+              ruleStartAppliedDate.setHours(rule.startHour);
+              ruleStartAppliedDate.setMinutes(rule.startMinute);
+
+              let ruleEndAppliedDate = rule.hasOwnProperty("startWeekday")
+                ? timeDay.offset(
+                    time,
+                    (rule.endWeekday as number) - time.getDay(),
+                  )
+                : new Date(time);
+              ruleEndAppliedDate.setHours(rule.endHour);
+              ruleEndAppliedDate.setMinutes(rule.endMinute);
+
+              return (
+                time >= ruleStartAppliedDate && endTime <= ruleEndAppliedDate
+              );
+            });
+            if (!slotExistsInOpenHours) {
+              availability = AvailabilityStatus.CLOSED;
+              freeCalendars.length = 0;
+            }
+          }
+        }
+
+        // Handle the Consecutive Events model, where a slot if busy if it falls within a consecutive timeslot.
+        // None of the other above rules should apply, except (maybe!) Buffer and Open Hours.
+        if (_this.events?.length > 1 && consecutiveOptions.length) {
+          const existsWithinConsecutiveBlock = consecutiveOptions.some(
+            (event) => {
+              return (
+                time >= event[0].start_time &&
+                endTime <= event[event.length - 1].end_time
+              );
+            },
+          );
+          if (existsWithinConsecutiveBlock) {
+            availability = AvailabilityStatus.FREE;
+            freeCalendars.length = consecutiveParticipants.length;
+          } else {
+            availability = AvailabilityStatus.BUSY;
+            freeCalendars.length = 0;
+          }
+        }
+
+        const dateOffset =
+          (new Date(time).getTime() - new Date().getTime()) /
+          (1000 * 60 * 60 * 24);
+
+        return {
+          selectionStatus: SelectionStatus.UNSELECTED,
+          calendar_id: calendarID,
+          availability: availability,
+          available_calendars: freeCalendars,
+          start_time: time,
+          end_time: endTime,
+          isBookable:
+            dateOffset >= 0 &&
+            dateOffset >= _this.min_book_ahead_days &&
+            dateOffset <= _this.max_book_ahead_days,
+        };
+      });
+  };
 
   let ticks: Date[] = [];
 
@@ -353,48 +615,181 @@
       return [];
     }
 
-    const tickIters = slotSizes[intervalCounter];
+    // const tickIters = slotSizes[intervalCounter];
 
     // ternary here because timeMinute.every(120) doesnt work, but timeHour.every(2) does.
-    let timeInterval =
-      tickIters > 60
-        ? timeHour.every(tickIters / 60)
-        : timeMinute.every(tickIters);
-
-    ticks = scaleTime()
-      .domain(ticks)
-      .ticks(timeInterval as TimeInterval);
 
     const averageTickHeight = height / ticks.length;
 
-    if (
-      tickIters < _this.slot_size || // dont show 15-min ticks if slot size is hourly
-      (averageTickHeight < minimumTickHeight && // make sure ticks're at least yea-pixels tall
-        intervalCounter < slotSizes.length) // don't try to keep going if youve reached every 6 hours. Subdividing a day into fewer than 4 parts doesn't yield a nice result.
-    ) {
-      return generateTicks(height, ticks, intervalCounter + 1);
-    } else {
-      return ticks;
+    for (const tickIters of slotSizes) {
+      let timeInterval =
+        tickIters > 60
+          ? timeHour.every(tickIters / 60)
+          : timeMinute.every(tickIters);
+
+      ticks = scaleTime()
+        .domain(ticks)
+        .ticks(timeInterval as TimeInterval);
+      if (
+        tickIters < _this.slot_size || // dont show 15-min ticks if slot size is hourly
+        (averageTickHeight < minimumTickHeight && // make sure ticks're at least yea-pixels tall
+          intervalCounter < slotSizes.length) // don't try to keep going if youve reached every 6 hours. Subdividing a day into fewer than 4 parts doesn't yield a nice result.
+      ) {
+        break;
+      }
     }
+
+    return ticks;
   };
 
+  // Consecutive same-availability periods of time, from earliest start_time to latest end_time.
+  function generateEpochs(
+    slots: SelectableSlot[],
+    partialBookableRatio: number,
+  ) {
+    const epochScale = scaleTime().domain([
+      slots[0].start_time,
+      slots[slots.length - 1].end_time,
+    ]);
+    let epochs = slots
+      .reduce((epochList, slot) => {
+        const prevEpoch = epochList[epochList.length - 1];
+        // Edge case note: available_calendars is doing a stringified array compare,
+        // which means if they're differently ordered but otherwise teh same, this will fail.
+        if (
+          prevEpoch &&
+          JSON.stringify(prevEpoch[0].available_calendars) ===
+            JSON.stringify(slot.available_calendars) &&
+          prevEpoch[0].availability === slot.availability
+        ) {
+          prevEpoch.push(slot);
+        } else {
+          epochList.push([slot]);
+        }
+        return epochList;
+      }, [] as SelectableSlot[][])
+      .map((epoch) => {
+        let status = "free";
+
+        const numFreeCalendars = epoch[0].available_calendars.length;
+        const fewerCalendarsThanRatio =
+          numFreeCalendars !== allCalendars.length &&
+          numFreeCalendars < allCalendars.length * partialBookableRatio;
+
+        if (
+          numFreeCalendars === 0 ||
+          fewerCalendarsThanRatio ||
+          (_this.required_participants.length &&
+            !allRequiredParticipantsIncluded(epoch[0].available_calendars))
+        ) {
+          if (epoch[0].availability === AvailabilityStatus.CLOSED) {
+            status = "closed";
+          } else {
+            status = "busy";
+          }
+        } else if (
+          numFreeCalendars > 0 &&
+          numFreeCalendars < allCalendars.length
+        ) {
+          status = "partial";
+        }
+
+        return {
+          start_time: epoch[0].start_time,
+          offset: epochScale(epoch[0].start_time) * 100,
+          status,
+          height:
+            (epochScale(epoch[epoch.length - 1].end_time) -
+              epochScale(epoch[0].start_time)) *
+            100,
+          end_time: epoch[epoch.length - 1].end_time,
+          slots: epoch.length,
+          available_calendars: epoch[0].available_calendars,
+        };
+      });
+    return epochs;
+  }
+
+  function generateDayRange(
+    startDay: Date,
+    endDay: Date,
+    reverse?: boolean,
+  ): Date[] {
+    let range = scaleTime()
+      .domain([startDay, endDay])
+      .ticks(timeDay)
+      .filter((timestamp: Date) => {
+        if (_this.show_weekends) {
+          return true;
+        } else {
+          return timestamp.getDay() !== 6 && timestamp.getDay() !== 0;
+        }
+      });
+    if (!_this.show_as_week && !_this.show_weekends) {
+      if (range.length < datesToShow) {
+        if (reverse) {
+          return generateDayRange(timeDay.offset(startDay, -1), endDay, true);
+        }
+        return generateDayRange(startDay, timeDay.offset(endDay, 1));
+      }
+    }
+    return range;
+  }
+
+  function checkOverbooked(slots: SelectableSlot[]) {
+    allCalendars.forEach((calendar) => {
+      let availableSlotsForCalendar = slots.filter((slot) =>
+        slot.available_calendars.includes(calendar.account?.emailAddress),
+      );
+      if (
+        slots.length - availableSlotsForCalendar.length >
+        (_this.overbooked_threshold * slots.length) / 100
+      ) {
+        availableSlotsForCalendar.forEach((slot) => {
+          slot.available_calendars = slot.available_calendars.filter(
+            (cal) => cal !== calendar.account?.emailAddress,
+          );
+          if (!slot.available_calendars.length) {
+            // if it has no calendars available, it's busy
+            slot.availability = AvailabilityStatus.BUSY;
+          } else if (
+            slot.availability === AvailabilityStatus.FREE &&
+            slot.available_calendars.length !== allCalendars.length
+          ) {
+            // if it was previously free, but now lacks a calendar, it should be considered Partial.
+            slot.availability = AvailabilityStatus.PARTIAL;
+          }
+        });
+      }
+    });
+
+    return slots;
+  }
+
   let days: Day[];
-  $: (async () =>
-    (days = stateId ? await StateStore.updateData(stateId, "days") : []))();
+  $: days = dayRange.map((timestamp: Date) => {
+    const slots = checkOverbooked(
+      generateDaySlots(timestamp, _this.start_hour, _this.end_hour),
+    ); // TODO: include other potential post-all-slots-established checks, like overbooked, in a single secondary run here.
+
+    return {
+      epochs: generateEpochs(slots, _this.partial_bookable_ratio),
+      slots,
+      timestamp,
+    };
+  });
   //#endregion data generation
 
   // #region timeSlot selection
   let slotSelection: SelectableSlot[] = [];
   let sortedSlots: SelectableSlot[] = [];
-  $: slotSelection = stateId
-    ? (days ?? [])
-        .map((day) =>
-          day.slots.filter(
-            (slot) => slot.selectionStatus === SelectionStatus.SELECTED,
-          ),
-        )
-        .flat()
-    : [];
+  $: slotSelection = (days ?? [])
+    .map((day) =>
+      day.slots.filter(
+        (slot) => slot.selectionStatus === SelectionStatus.SELECTED,
+      ),
+    )
+    .flat();
 
   $: sortedSlots = slotSelection
     .sort((a, b) => a.start_time.getTime() - b.start_time.getTime())
@@ -434,6 +829,21 @@
       lastDispatchedSlots = sortedSlots;
     }
   }
+
+  // https://derickbailey.com/2015/09/07/check-for-date-range-overlap-with-javascript-arrays-sorting-and-reducing/
+  function overlap(events: TimeSlot[], slot: TimeSlot) {
+    return events.reduce((result, current) => {
+      const overlap =
+        slot.start_time < current.end_time &&
+        current.start_time < slot.end_time;
+
+      if (overlap) {
+        // store the amount of overlap
+        result++;
+      }
+      return result;
+    }, 0);
+  }
   // #endregion timeSlot selection
 
   let consecutiveParticipants: string[] = [];
@@ -450,18 +860,6 @@
       slots: [],
     });
   }
-
-  $: optimalDatesToShow = Math.floor(_this.containerWidth / 100) || 1;
-
-  $: tooSmallForWeek = _this.show_as_week && optimalDatesToShow < 7;
-
-  $: startDay = (() => {
-    return _this.show_as_week && !tooSmallForWeek
-      ? timeWeek.floor(_this.start_date)
-      : timeDay.floor(_this.start_date);
-  })();
-
-  $: endDay = 1000;
 
   function getAvailabilityQuery(
     emailAddresses = singleEventParticipants,
@@ -518,7 +916,7 @@
 
   let requiredParticipants: string[] = [];
   $: requiredParticipants = [
-    ...new Set([..._this.required_participants, _this.booking_user_email]),
+    ...new Set([..._this.required_participants, booking_user_email]),
   ];
 
   async function getAvailability(forceReload = false) {
@@ -775,11 +1173,11 @@
 
   // #region Date Change
   function goToNextDate() {
-    // if (_this.show_as_week && !tooSmallForWeek) {
-    //   _this.start_date = timeWeek.offset(endDay, 1);
-    // } else {
-    //   _this.start_date = timeDay.offset(endDay, 1);
-    // }
+    if (_this.show_as_week && !tooSmallForWeek) {
+      _this.start_date = timeWeek.offset(endDay, 1);
+    } else {
+      _this.start_date = timeDay.offset(endDay, 1);
+    }
     // On date change, dispatch an empty list to let parent app trigger a loading state
     if (isConsecutive) {
       dispatchEvent("eventOptionsReady", {
@@ -794,12 +1192,12 @@
       // Can't do something as simple as `start_date = timeDay.offset(startDay, -datesToShow)` here;
       // broken case: !show_weekends, start_date = a monday, datesToShow = 3; go backwards. You'll get fri-mon-tues, rather than wed-thu-fri.
       // Instead, we generateDayRange() with reverse=true to take advance of recursive non-weekend range-making.
-      // let previousRange = generateDayRange(
-      //   timeDay.offset(startDay, -datesToShow),
-      //   timeDay.offset(endDay, -datesToShow),
-      //   true,
-      // );
-      // _this.start_date = previousRange[0];
+      let previousRange = generateDayRange(
+        timeDay.offset(startDay, -datesToShow),
+        timeDay.offset(endDay, -datesToShow),
+        true,
+      );
+      _this.start_date = previousRange[0];
     }
     // On date change, dispatch an empty list to let parent app trigger a loading state
     if (isConsecutive) {
@@ -1220,7 +1618,7 @@
 
   //#region colours
   // Show partial availability as a gradient, rather than as categorically "partial"
-  $: partialScale = scaleLinear<string>()
+  $: partialScale = scaleLinear()
     .domain([0, allCalendars.length / 2, allCalendars.length])
     .range([_this.busy_color, _this.partial_color, _this.free_color]);
   //#endregion colours
@@ -1356,6 +1754,7 @@
 {:else}
   <main
     bind:this={main}
+    bind:clientHeight
     class:ticked={_this.show_ticks && _this.view_as === "schedule"}
     class:timezone={_this.timezone}
     class:allow_booking={_this.allow_booking}
@@ -1421,6 +1820,7 @@
       class:timezone={_this.timezone}
       class:error={hasError}
       bind:this={dayContainer}
+      bind:clientWidth={dayContainerWidth}
     >
       {#each days as day, dayIndex (day.timestamp.toISOString())}
         <div
