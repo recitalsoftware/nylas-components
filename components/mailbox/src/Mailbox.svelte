@@ -50,6 +50,7 @@
 
   export let actions_bar: MailboxActions[];
   export let all_threads: Thread[];
+  export let thread_ids: string[];
   export let header: string = "Mailbox";
   export let items_per_page: number;
   export let keyword_to_search: string;
@@ -70,6 +71,7 @@
     actions_bar: [],
     items_per_page: 13,
     query_string: "in=inbox",
+    thread_ids: undefined,
     show_star: false,
     show_thread_checkbox: true,
     show_reply: false,
@@ -134,9 +136,13 @@
     };
     // Initialize labels / folders
     if (you?.organization_unit === AccountOrganizationUnit.Label) {
-      labels = await LabelStore.getLabels(accountOrganizationUnitQuery);
+      LabelStore.getLabels(accountOrganizationUnitQuery).then(
+        (ls) => (labels = ls),
+      );
     } else if (you?.organization_unit === AccountOrganizationUnit.Folder) {
-      folders = await FolderStore.getFolders(accountOrganizationUnitQuery);
+      FolderStore.getFolders(accountOrganizationUnitQuery).then(
+        (fs) => (folders = fs),
+      );
     }
 
     await updateDisplayedThreads();
@@ -181,6 +187,7 @@
       query: Object.fromEntries(
         new URLSearchParams(_this.query_string?.replaceAll(" ", "&")),
       ),
+      thread_ids,
     };
 
     if (_this.keyword_to_search) {
@@ -757,6 +764,7 @@
       font-weight: bold;
       background: var(--nylas-mailbox-header-background, white);
       color: var(--nylas-email-subject-color, black);
+      background-color: #fff;
       button {
         svg {
           fill: var(--nylas-email-subject-color, black);
@@ -781,6 +789,7 @@
       padding: $spacing-s $spacing-m;
       gap: $spacing-m;
       min-height: 24px;
+      background-color: #fff;
 
       .thread-checkbox {
         display: flex;
@@ -885,7 +894,7 @@
       // #region define background styles
       // --nylas-email-border-left-width: 0px;
       --nylas-email-background: transparent;
-      --nylas-email-unread-background: transparent;
+      --nylas-email-unread-background: #fff;
 
       &:not(.unread) {
         background: var(--nylas-mailbox-read-background, var(--grey-lightest));
