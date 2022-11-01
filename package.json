@@ -128,5 +128,6 @@
     "@nylas/components-schedule-editor": "file:components/schedule-editor",
     "@nylas/components-theming": "file:components/theming",
     "concurrently": "6.0.0"
-  }
+  },
+  "packageManager": "yarn@3.2.4"
 }
